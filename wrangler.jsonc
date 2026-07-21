@@ -17,19 +17,19 @@
     {
       "binding": "DB",
       "database_name": "troncarnival",
-      "database_id": "6ad478e8-6eba-43e1-b4de-4b4b9aaaa310"
+      "database_id": "25975082-f2c2-4043-80e7-48b429183f7b"
     }
   ],
   "queues": {
     "producers": [
       {
-        "queue": "broadcasts",
+        "queue": "troncarnival",
         "binding": "QUEUE"
       }
     ],
     "consumers": [
       {
-        "queue": "broadcasts",
+        "queue": "troncarnival",
         "max_batch_size": 50,
         "max_batch_timeout": 5,
         "max_retries": 5,
