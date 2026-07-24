@@ -136,22 +136,22 @@ export async function setState(
 // ── Bulk (for broadcasts) ─────────────────────────────────────
 
 /**
- * Returns user IDs in ascending order with cursor-based pagination.
+ * Returns user IDs in ascending order with cursor-based pagination (keyset).
  *
  * D1 limits query results to 10,000 rows. For broadcasts, callers must
- * loop with increasing offsets until fewer than `limit` rows are returned.
+ * loop with increasing lastId until fewer than `limit` rows are returned.
  *
- * @param limit  Max rows per page (default 10,000 — D1 hard limit)
- * @param offset Row offset for pagination
+ * @param limit  Max rows per page (default 100 for Queues limits)
+ * @param lastId The last ID seen from the previous page, or 0 for the first page
  */
 export async function getAllUserIds(
   db: D1Database,
-  limit = 10_000,
-  offset = 0,
+  limit = 100,
+  lastId = 0,
 ): Promise<number[]> {
   const { results } = await db
-    .prepare('SELECT id FROM users ORDER BY id ASC LIMIT ? OFFSET ?')
-    .bind(limit, offset)
+    .prepare('SELECT id FROM users WHERE id > ? ORDER BY id ASC LIMIT ?')
+    .bind(lastId, limit)
     .all<{ id: number }>();
   return results.map(r => r.id);
 }

@@ -13,7 +13,9 @@ import type { Env } from './types';
  *
  * Ack/Retry strategy:
  *   - 403 (user blocked bot): ack — no point retrying, message undeliverable.
+ *   - 400 (chat not found/deactivated): ack — permanent error.
  *   - 429 (rate limited): retry with Retry-After delay from Telegram's response.
+ *   - 5xx (Telegram internal errors): retry with backoff.
  *   - Network error: retry (transient failure, Worker may have lost connectivity).
  *   - All others: ack with error log — prevents dead-letter pileup on Telegram bugs.
  *
@@ -56,6 +58,13 @@ export async function handleQueue(
             return;
           }
 
+          // 400 = bad request (e.g., user deactivated, chat not found) — permanent failure
+          if (res.status === 400) {
+            console.warn(`Broadcast to ${userId} failed permanently (400): ${err.description}`);
+            msg.ack();
+            return;
+          }
+
           // 429 = Telegram rate limit — retry after the specified delay
           if (res.status === 429) {
             const retryAfter = err.parameters?.retry_after ?? 5;
@@ -64,8 +73,15 @@ export async function handleQueue(
             return;
           }
 
+          // 5xx = Telegram server errors — transient failure, safe to retry
+          if (res.status >= 500) {
+            console.warn(`Broadcast to ${userId}: Telegram server error (${res.status}), retrying.`);
+            msg.retry({ delaySeconds: 10 });
+            return;
+          }
+
           // All other non-OK responses: log and ack to prevent infinite retries
-          // on persistent Telegram-side errors (e.g., chat_not_found, user_deactivated).
+          // on persistent Telegram-side errors.
           console.error(`Broadcast to ${userId} failed (${res.status}): ${err.description}`);
           msg.ack();
           return;
@@ -75,7 +91,7 @@ export async function handleQueue(
       } catch (err) {
         // Network/fetch error — transient, safe to retry
         console.error(`Broadcast fetch error for ${userId}:`, err);
-        msg.retry();
+        msg.retry({ delaySeconds: 10 });
       }
     }),
   );

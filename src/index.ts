@@ -5,6 +5,7 @@
 
 import { timingSafeEqual } from 'node:crypto';
 import { Bot, webhookCallback } from 'grammy';
+import { autoRetry } from '@grammyjs/auto-retry';
 import type { Env, BroadcastMessage } from './types';
 import { E, MAIN_MENU_MARKUP } from './config';
 
@@ -31,6 +32,9 @@ import { getUser } from './db/users';
 
 function createBot(env: Env): Bot {
   const bot = new Bot(env.BOT_TOKEN);
+  
+  // Use autoRetry plugin to automatically handle 429 Rate Limits from Telegram
+  bot.api.config.use(autoRetry());
 
   // ── Register all handlers ──────────────────────────────────
 
@@ -115,8 +119,12 @@ export default {
     // ── /setup — register webhook with Telegram ─────────────
     //
     // Also registers the webhook secret token when WEBHOOK_SECRET is set.
-    // Run this once after deployment: curl https://your-worker.workers.dev/setup
+    // Secure it by requiring the secret in the query string: /setup?secret=...
     if (url.pathname === '/setup') {
+      if (env.WEBHOOK_SECRET && url.searchParams.get('secret') !== env.WEBHOOK_SECRET) {
+        return new Response('Unauthorized - Invalid secret parameter', { status: 401 });
+      }
+
       const webhookUrl = `https://${url.hostname}/webhook`;
       const body: Record<string, unknown> = {
         url: webhookUrl,
@@ -147,10 +155,17 @@ export default {
       }
 
       const bot = createBot(env);
-      // The 'cloudflare-mod' adapter handles ctx.waitUntil internally —
-      // do NOT additionally wrap this call in ctx.waitUntil().
-      const handleUpdate = webhookCallback(bot, 'cloudflare-mod');
-      return handleUpdate(request);
+      // The 'cloudflare-mod' adapter handles ctx.waitUntil internally.
+      // We set a timeout to prevent the worker from hanging if Telegram is slow.
+      const handleUpdate = webhookCallback(bot, 'cloudflare-mod', { timeoutMilliseconds: 10000 });
+      
+      try {
+        return await handleUpdate(request);
+      } catch (err) {
+        console.error('Error handling update:', err);
+        // Return 200 to prevent Telegram from infinitely retrying a failing update
+        return new Response('OK', { status: 200 });
+      }
     }
 
     // ── Health check ────────────────────────────────────────

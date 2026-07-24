@@ -23,9 +23,8 @@ import {
 import { getUser, getAllUserIds } from '../db/users';
 
 // ── Queue sendBatch limit ──────────────────────────────────────
-// Cloudflare Queues supports up to 10,000 messages per sendBatch call.
-// D1 also returns a max of 10,000 rows per query — matching limits intentionally.
-const QUEUE_BATCH_SIZE = 10_000;
+// Cloudflare Queues supports up to 100 messages per sendBatch call.
+const QUEUE_BATCH_SIZE = 100;
 
 export function registerAdminHandlers(bot: Bot, env: Env): void {
   // ── Guard: all admin commands require admin check ──────────
@@ -322,10 +321,8 @@ export function registerAdminHandlers(bot: Bot, env: Env): void {
 
   // ── /broadcast — send message to all users via Queue ──────
   //
-  // Uses sendBatch() (up to 10,000 msgs per call) instead of individual
-  // send() calls — reduces Queue API round-trips from N to ceil(N/10000).
-  // Fetches user IDs in pages matching the Queue batch size to avoid
-  // unbounded D1 result sets (D1 max rows per query: 10,000).
+  // Uses sendBatch() (up to 100 msgs per call, max 256KB).
+  // Fetches user IDs with keyset pagination.
 
   bot.command('broadcast', async ctx => {
     if (!(await adminGuard(ctx))) return;
@@ -336,14 +333,13 @@ export function registerAdminHandlers(bot: Bot, env: Env): void {
       return;
     }
 
-    let offset = 0;
+    let lastId = 0;
     let totalSent = 0;
 
     while (true) {
-      const userIds = await getAllUserIds(env.DB, QUEUE_BATCH_SIZE, offset);
+      const userIds = await getAllUserIds(env.DB, QUEUE_BATCH_SIZE, lastId);
       if (userIds.length === 0) break;
 
-      // sendBatch is up to 10,000 messages per call — perfectly matches our page size
       await env.QUEUE.sendBatch(
         userIds.map((userId): MessageSendRequest<BroadcastMessage> => ({
           body: { userId, text, parse_mode: 'HTML' },
@@ -351,8 +347,9 @@ export function registerAdminHandlers(bot: Bot, env: Env): void {
       );
 
       totalSent += userIds.length;
+      lastId = userIds[userIds.length - 1]; // Advance the cursor
+
       if (userIds.length < QUEUE_BATCH_SIZE) break; // last page
-      offset += userIds.length;
     }
 
     await ctx.reply(
@@ -362,3 +359,4 @@ export function registerAdminHandlers(bot: Bot, env: Env): void {
     );
   });
 }
+
