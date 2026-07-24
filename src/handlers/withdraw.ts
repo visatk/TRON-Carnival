@@ -61,11 +61,9 @@ export function registerWithdrawHandler(bot: Bot, env: Env): void {
 
     // ── Duplicate pending check ───────────────────────────────
     //
-    // Prevents a user from submitting multiple withdrawal requests before
-    // the first one is processed by an admin. The balance is deducted when
-    // the withdrawal is created, so without this guard a user could drain
-    // their balance to 0 and then attempt to submit another request that
-    // would pass the balance check on a cached/stale value.
+    // Early guard for UX — the actual atomic enforcement is inside createWithdrawal.
+    // This check is not the security boundary (the atomic SQL is), but provides a
+    // fast, friendly message before attempting the DB write.
     const alreadyPending = await hasPendingWithdrawal(env.DB, ctx.from.id);
     if (alreadyPending) {
       await ctx.reply(
@@ -77,14 +75,31 @@ export function registerWithdrawHandler(bot: Bot, env: Env): void {
       return;
     }
 
-    // ── Process withdrawal ───────────────────────────────────
-    const amount = user.balance; // capture before deduction
+    // ── Process withdrawal (atomic) ──────────────────────────
+    //
+    // createWithdrawal atomically:
+    //   1. Checks no pending withdrawal exists
+    //   2. Verifies balance >= amount
+    //   3. Deducts balance
+    //   4. Inserts withdrawal record
+    // Returns null if any of these conditions fail (race condition safety).
+    const amount = user.balance;
     const withdrawalId = await createWithdrawal(
       env.DB,
       ctx.from.id,
       amount,
       user.wallet_address,
     );
+
+    if (withdrawalId === null) {
+      // Another concurrent request beat us to it
+      await ctx.reply(
+        `${E.timer} <b>Pending Request Exists</b>\n\n` +
+          `You already have a pending withdrawal. Please wait for it to be processed.`,
+        { parse_mode: 'HTML' },
+      );
+      return;
+    }
 
     await ctx.reply(
       `${E.check} <b>Withdrawal Request Submitted!</b>\n\n` +

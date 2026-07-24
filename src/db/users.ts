@@ -68,26 +68,28 @@ export async function addBalance(
     .run();
 }
 
+/**
+ * Atomically deducts amount from user balance only if balance is sufficient.
+ * Uses WHERE balance >= ? to prevent balance going negative under any race condition.
+ * Returns true if the deduction happened, false if the balance was too low.
+ */
 export async function deductBalance(
   db: D1Database,
   userId: number,
   amount: number,
 ): Promise<boolean> {
-  const user = await getUser(db, userId);
-  if (!user || user.balance < amount) return false;
-
-  await db
-    .prepare('UPDATE users SET balance = balance - ? WHERE id = ?')
-    .bind(amount, userId)
+  const result = await db
+    .prepare('UPDATE users SET balance = balance - ? WHERE id = ? AND balance >= ?')
+    .bind(amount, userId, amount)
     .run();
-  return true;
+  return (result.meta.changes ?? 0) > 0;
 }
 
 // ── Join bonus ────────────────────────────────────────────────
 
 /**
  * Claims the join bonus atomically — marks the flag and credits balance
- * in a single D1 batch so both succeed or fail together.
+ * in a single conditional UPDATE.
  * Idempotent: returns false if the bonus was already claimed.
  */
 export async function claimJoinBonus(
@@ -133,15 +135,25 @@ export async function setState(
     .run();
 }
 
+export async function clearState(
+  db: D1Database,
+  userId: number,
+): Promise<void> {
+  await db
+    .prepare('UPDATE users SET state = NULL WHERE id = ?')
+    .bind(userId)
+    .run();
+}
+
 // ── Bulk (for broadcasts) ─────────────────────────────────────
 
 /**
- * Returns user IDs in ascending order with cursor-based pagination (keyset).
+ * Returns user IDs in ascending order with cursor-based keyset pagination.
  *
- * D1 limits query results to 10,000 rows. For broadcasts, callers must
- * loop with increasing lastId until fewer than `limit` rows are returned.
+ * Uses WHERE id > ? to avoid O(N) OFFSET scans on large tables.
+ * Callers loop until fewer than `limit` rows are returned.
  *
- * @param limit  Max rows per page (default 100 for Queues limits)
+ * @param limit  Max rows per page (≤100 to match Cloudflare Queue sendBatch limit)
  * @param lastId The last ID seen from the previous page, or 0 for the first page
  */
 export async function getAllUserIds(

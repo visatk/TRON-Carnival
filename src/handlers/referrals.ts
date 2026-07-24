@@ -25,7 +25,7 @@ export function registerReferralsHandler(bot: Bot, env: Env): void {
       return;
     }
 
-    const referralLink = buildReferralLink(me.username!, ctx.from.id);
+    const referralLink = buildReferralLink(me.username ?? 'bot', ctx.from.id);
 
     const text =
       `${E.users} <b>Your Referral Dashboard</b>\n\n` +

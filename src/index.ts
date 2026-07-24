@@ -22,7 +22,21 @@ import { registerAdminHandlers } from './handlers/admin';
 import { handleQueue } from './queue';
 
 // DB helpers (for state-based text routing)
-import { getUser } from './db/users';
+import { getUser, clearState } from './db/users';
+
+// ── Menu button texts (must exactly match MAIN_MENU_MARKUP) ──
+//
+// Used in the global fallback handler to detect when a user in a
+// multi-step state (e.g. awaiting_wallet) taps a menu button instead
+// of completing the flow. We clear their state so they don't get stuck.
+
+const MENU_BUTTONS = new Set([
+  `${E.tasks} Tasks`,
+  `${E.users} Referrals`,
+  `${E.wallet} Wallet`,
+  `${E.withdraw} Withdraw`,
+  `${E.stats} Statistics`,
+]);
 
 // ── Bot factory ───────────────────────────────────────────────
 //
@@ -32,8 +46,9 @@ import { getUser } from './db/users';
 
 function createBot(env: Env): Bot {
   const bot = new Bot(env.BOT_TOKEN);
-  
-  // Use autoRetry plugin to automatically handle 429 Rate Limits from Telegram
+
+  // Automatically handle 429 Rate Limit responses from Telegram by
+  // waiting the required retry_after delay and retrying the request.
   bot.api.config.use(autoRetry());
 
   // ── Register all handlers ──────────────────────────────────
@@ -67,6 +82,17 @@ function createBot(env: Env): Bot {
 
     // State-based routing
     if (user.state === 'awaiting_wallet') {
+      // If user taps a menu button while in awaiting_wallet state, clear state
+      // and show the menu — don't try to parse the button text as a wallet address.
+      if (MENU_BUTTONS.has(ctx.message.text)) {
+        await clearState(env.DB, ctx.from.id);
+        await ctx.reply(
+          `${E.rocket} <b>Task Hub</b>\n${E.money} Complete tasks & stack rewards!`,
+          { parse_mode: 'HTML', reply_markup: MAIN_MENU_MARKUP },
+        );
+        return;
+      }
+
       await handleWalletInput(
         {
           from: ctx.from,
@@ -113,13 +139,13 @@ function validateWebhookSecret(request: Request, secret: string): boolean {
 
 export default {
   // ── HTTP fetch handler (Telegram webhook) ──────────────────
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     // ── /setup — register webhook with Telegram ─────────────
     //
-    // Also registers the webhook secret token when WEBHOOK_SECRET is set.
-    // Secure it by requiring the secret in the query string: /setup?secret=...
+    // Secured: requires WEBHOOK_SECRET as a query param.
+    // Usage: curl "https://your-worker.workers.dev/setup?secret=YOUR_SECRET"
     if (url.pathname === '/setup') {
       if (env.WEBHOOK_SECRET && url.searchParams.get('secret') !== env.WEBHOOK_SECRET) {
         return new Response('Unauthorized - Invalid secret parameter', { status: 401 });
@@ -128,6 +154,7 @@ export default {
       const webhookUrl = `https://${url.hostname}/webhook`;
       const body: Record<string, unknown> = {
         url: webhookUrl,
+        max_connections: 100,
         allowed_updates: ['message', 'callback_query'],
       };
       if (env.WEBHOOK_SECRET) {
@@ -155,20 +182,20 @@ export default {
       }
 
       const bot = createBot(env);
-      // The 'cloudflare-mod' adapter handles ctx.waitUntil internally.
-      // We set a timeout to prevent the worker from hanging if Telegram is slow.
-      const handleUpdate = webhookCallback(bot, 'cloudflare-mod', { timeoutMilliseconds: 10000 });
-      
+      // The 'cloudflare-mod' adapter uses waitUntil internally.
+      // timeoutMilliseconds prevents the worker hanging if Telegram is slow.
+      const handleUpdate = webhookCallback(bot, 'cloudflare-mod', { timeoutMilliseconds: 10_000 });
+
       try {
         return await handleUpdate(request);
       } catch (err) {
-        console.error('Error handling update:', err);
-        // Return 200 to prevent Telegram from infinitely retrying a failing update
+        console.error('Error handling webhook update:', err);
+        // Return 200 so Telegram does not infinitely retry a failing update
         return new Response('OK', { status: 200 });
       }
     }
 
-    // ── Health check ────────────────────────────────────────
+    // ── /health — health check ───────────────────────────────
     if (url.pathname === '/health') {
       return new Response('OK', { status: 200 });
     }

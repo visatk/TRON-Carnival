@@ -2,7 +2,7 @@
 // src/handlers/admin.ts — Admin-only command handlers
 // ============================================================
 
-import { Bot, Context, InlineKeyboard } from 'grammy';
+import { Bot, Context } from 'grammy';
 import type { Env, BroadcastMessage } from '../types';
 import {
   E,
@@ -20,17 +20,18 @@ import {
   rejectWithdrawal,
   getWithdrawal,
 } from '../db/withdrawals';
-import { getUser, getAllUserIds } from '../db/users';
+import { getAllUserIds } from '../db/users';
 
 // ── Queue sendBatch limit ──────────────────────────────────────
-// Cloudflare Queues supports up to 100 messages per sendBatch call.
+// Cloudflare Queues supports up to 100 messages per sendBatch call (256KB max payload).
 const QUEUE_BATCH_SIZE = 100;
+
+// ── Telegram message size limit ────────────────────────────────
+// Telegram rejects messages longer than 4096 characters.
+const TG_MSG_LIMIT = 4000; // use 4000 to leave room for formatting
 
 export function registerAdminHandlers(bot: Bot, env: Env): void {
   // ── Guard: all admin commands require admin check ──────────
-  //
-  // Typed as Context (not any) so TypeScript checks that ctx.reply
-  // exists and all property accesses are valid.
 
   const adminGuard = async (ctx: Context): Promise<boolean> => {
     if (!ctx.from || !isAdmin(ctx.from.id, env.ADMIN_IDS)) {
@@ -111,7 +112,7 @@ export function registerAdminHandlers(bot: Bot, env: Env): void {
     const reward = parseFloat(rewardStr);
 
     if (isNaN(reward) || reward <= 0) {
-      await ctx.reply(`${E.cross} Invalid reward amount.`);
+      await ctx.reply(`${E.cross} Invalid reward amount. Must be a positive number.`);
       return;
     }
     if (!link.startsWith('http')) {
@@ -130,6 +131,7 @@ export function registerAdminHandlers(bot: Bot, env: Env): void {
   });
 
   // ── /tasks_list — list all tasks ──────────────────────────
+  // Splits into multiple messages if content exceeds Telegram's 4096-char limit.
 
   bot.command('tasks_list', async ctx => {
     if (!(await adminGuard(ctx))) return;
@@ -140,18 +142,19 @@ export function registerAdminHandlers(bot: Bot, env: Env): void {
       return;
     }
 
-    const text =
-      `${E.tasks} <b>All Tasks</b>\n\n` +
-      tasks
-        .map(
-          t =>
-            `<b>ID ${t.id}</b> ${t.is_active ? '🟢' : '🔴'} <b>${t.title}</b>\n` +
-            `  ${E.money} ${formatTRX(t.reward)} | ${E.link} ${t.link}\n` +
-            `  /deltask_${t.id} | /toggletask_${t.id}`,
-        )
-        .join('\n\n');
+    const header = `${E.tasks} <b>All Tasks</b>\n\n`;
+    const entries = tasks.map(
+      t =>
+        `<b>ID ${t.id}</b> ${t.is_active ? '🟢' : '🔴'} <b>${t.title}</b>\n` +
+        `  ${E.money} ${formatTRX(t.reward)} | ${E.link} ${t.link}\n` +
+        `  /deltask_${t.id} | /toggletask_${t.id}`,
+    );
 
-    await ctx.reply(text, { parse_mode: 'HTML' });
+    // Chunk entries to avoid exceeding Telegram's 4096-char message limit
+    const chunks = splitIntoChunks(entries, header, TG_MSG_LIMIT);
+    for (const chunk of chunks) {
+      await ctx.reply(chunk, { parse_mode: 'HTML' });
+    }
   });
 
   // ── /deltask_<id> — delete a task ─────────────────────────
@@ -177,6 +180,7 @@ export function registerAdminHandlers(bot: Bot, env: Env): void {
   });
 
   // ── /withdrawals — list pending withdrawal requests ────────
+  // Splits into multiple messages if content exceeds Telegram's 4096-char limit.
 
   bot.command('withdrawals', async ctx => {
     if (!(await adminGuard(ctx))) return;
@@ -187,20 +191,20 @@ export function registerAdminHandlers(bot: Bot, env: Env): void {
       return;
     }
 
-    const text =
-      `${E.withdraw} <b>Pending Withdrawals (${pending.length})</b>\n\n` +
-      pending
-        .map(
-          w =>
-            `<b>#${w.id}</b> — User <code>${w.user_id}</code>\n` +
-            `  ${E.money} ${formatTRX(w.amount)}\n` +
-            `  ${E.wallet} <code>${w.wallet_address}</code>\n` +
-            `  📅 ${formatDate(w.created_at)}\n` +
-            `  /approve_${w.id} | /reject_${w.id}`,
-        )
-        .join('\n\n');
+    const header = `${E.withdraw} <b>Pending Withdrawals (${pending.length})</b>\n\n`;
+    const entries = pending.map(
+      w =>
+        `<b>#${w.id}</b> — User <code>${w.user_id}</code>\n` +
+        `  ${E.money} ${formatTRX(w.amount)}\n` +
+        `  ${E.wallet} <code>${w.wallet_address}</code>\n` +
+        `  📅 ${formatDate(w.created_at)}\n` +
+        `  /approve_${w.id} | /reject_${w.id}`,
+    );
 
-    await ctx.reply(text, { parse_mode: 'HTML' });
+    const chunks = splitIntoChunks(entries, header, TG_MSG_LIMIT);
+    for (const chunk of chunks) {
+      await ctx.reply(chunk, { parse_mode: 'HTML' });
+    }
   });
 
   // ── /approve_<id> — approve a withdrawal ──────────────────
@@ -219,7 +223,7 @@ export function registerAdminHandlers(bot: Bot, env: Env): void {
 
     const approved = await approveWithdrawal(env.DB, id, txHash);
     if (!approved) {
-      await ctx.reply(`${E.cross} Withdrawal #${id} is not pending.`);
+      await ctx.reply(`${E.cross} Withdrawal #${id} is not pending (already processed).`);
       return;
     }
 
@@ -304,7 +308,7 @@ export function registerAdminHandlers(bot: Bot, env: Env): void {
     const raw = ctx.match?.trim() ?? '';
     if (!raw) {
       await ctx.reply(
-        `${E.pencil} <b>Usage:</b> /setchannels &lt;@Chan1,@Chan2&gt;\n\nSend empty to clear: /setchannels clear`,
+        `${E.pencil} <b>Usage:</b> /setchannels &lt;@Chan1,@Chan2&gt;\n\nTo clear all channels: /setchannels clear`,
         { parse_mode: 'HTML' },
       );
       return;
@@ -321,8 +325,8 @@ export function registerAdminHandlers(bot: Bot, env: Env): void {
 
   // ── /broadcast — send message to all users via Queue ──────
   //
-  // Uses sendBatch() (up to 100 msgs per call, max 256KB).
-  // Fetches user IDs with keyset pagination.
+  // Uses sendBatch() (100 msgs per call, 256KB max payload).
+  // Fetches user IDs with keyset pagination (WHERE id > ?) for O(1) performance.
 
   bot.command('broadcast', async ctx => {
     if (!(await adminGuard(ctx))) return;
@@ -347,7 +351,7 @@ export function registerAdminHandlers(bot: Bot, env: Env): void {
       );
 
       totalSent += userIds.length;
-      lastId = userIds[userIds.length - 1]; // Advance the cursor
+      lastId = userIds[userIds.length - 1]; // Advance cursor
 
       if (userIds.length < QUEUE_BATCH_SIZE) break; // last page
     }
@@ -360,3 +364,27 @@ export function registerAdminHandlers(bot: Bot, env: Env): void {
   });
 }
 
+// ── Helpers ───────────────────────────────────────────────────
+
+/**
+ * Splits an array of message entries into chunks that fit within Telegram's
+ * message size limit. The first chunk includes the header; subsequent chunks
+ * use a continuation header.
+ */
+function splitIntoChunks(entries: string[], header: string, limit: number): string[] {
+  const chunks: string[] = [];
+  let current = header;
+
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i] + (i < entries.length - 1 ? '\n\n' : '');
+    if (current.length + entry.length > limit && current !== header) {
+      chunks.push(current.trimEnd());
+      current = `<i>(continued...)</i>\n\n` + entry;
+    } else {
+      current += entry;
+    }
+  }
+
+  if (current.trim()) chunks.push(current.trimEnd());
+  return chunks;
+}

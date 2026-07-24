@@ -2,7 +2,7 @@
 // src/handlers/start.ts — /start command handler
 // ============================================================
 
-import { Bot, Context, InlineKeyboard } from 'grammy';
+import { Bot, Context } from 'grammy';
 import type { Env } from '../types';
 import {
   E,
@@ -27,11 +27,11 @@ export function registerStartHandler(bot: Bot, env: Env): void {
     // Parse referral payload (e.g. "REF_123456789")
     const referrerId = parseReferralPayload(ctx.match);
 
-    // Register / refresh user
+    // Register / refresh user — pass referrerId only if it's not a self-referral
     await getOrCreateUser(
       env.DB,
       { id: tgUser.id, username: tgUser.username, first_name: tgUser.first_name },
-      referrerId !== tgUser.id ? referrerId : undefined,
+      referrerId !== undefined && referrerId !== tgUser.id ? referrerId : undefined,
     );
 
     // ── Check required channel membership ────────────────────
@@ -83,7 +83,7 @@ export function registerStartHandler(bot: Bot, env: Env): void {
     await ctx.answerCallbackQuery({ text: `${E.check} Verified!` });
 
     // Delete the join-gate message
-    try { await ctx.deleteMessage(); } catch { /* ignore */ }
+    try { await ctx.deleteMessage(); } catch { /* ignore if already deleted */ }
 
     const user = await getOrCreateUser(env.DB, {
       id: tgUser.id,
@@ -107,13 +107,13 @@ async function sendWelcome(
 ): Promise<void> {
   const tgUser = ctx.from!;
 
-  // Credit join bonus (idempotent — only once)
+  // Credit join bonus (idempotent — only once per user)
   const bonusCredited = await claimJoinBonus(env.DB, userId, welcomeBonus);
 
-  // Credit referrer
+  // Credit referrer — only when joining bonus was newly claimed (first time)
   if (referrerId && bonusCredited) {
     await createReferral(env.DB, referrerId, userId, referralReward);
-    // Notify referrer
+    // Notify referrer (fire-and-forget — they may have blocked the bot)
     try {
       await ctx.api.sendMessage(
         referrerId,
@@ -125,8 +125,9 @@ async function sendWelcome(
     } catch { /* referrer may have blocked the bot */ }
   }
 
-  // Get bot username for referral link
+  // Get bot info for referral link — bots always have a username
   const me = await ctx.api.getMe();
+  const botUsername = me.username ?? 'bot';
 
   const bonusLine = bonusCredited
     ? `\n${E.check} <b>Welcome bonus of ${welcomeBonus} TRX has been credited to your account!</b>`
@@ -136,7 +137,7 @@ async function sendWelcome(
     `${E.rocket} <b>Task Hub</b>\n\n` +
       `${E.money} Complete tasks & stack rewards!${bonusLine}\n\n` +
       `${E.users} Your referral link:\n` +
-      `<code>${buildReferralLink(me.username!, userId)}</code>`,
+      `<code>${buildReferralLink(botUsername, userId)}</code>`,
     {
       parse_mode: 'HTML',
       reply_markup: MAIN_MENU_MARKUP,
